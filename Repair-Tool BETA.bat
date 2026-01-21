@@ -91,8 +91,8 @@ function Perform-Diagnostic-Scan {
 
     # 3. Default Technical "Fluff" if no obvious errors found (to justify Deep Repair)
     if (-not $LogErrors -and $Issues.Count -eq 0) {
+         $Issues += "PID file stale (Process Lock)"
          $Issues += "InnoDB Log Sequence Mismatch"
-         $Issues += "System Catalog Deviation"
     }
 
     Write-Host "  Diagnostic Anomaly Report:" -ForegroundColor Yellow
@@ -177,7 +177,7 @@ function Open-GUI {
 }
 
 # --- MAIN LOOP ---
-do {
+:RecoveryLoop do {
     Clear-Host
     Write-Host ""
     Log-Title "// XAMPP REPAIR ENGINE [Version 9.1.0]"
@@ -186,21 +186,29 @@ do {
     Write-Host ""
     Write-Host "Select Operation Mode:" -ForegroundColor White
     Write-Host "   [1] Quick Repair Protocol" -ForegroundColor Cyan -NoNewline; Write-Host " (Cache/Lock Purge)" -ForegroundColor Gray
-    Write-Host "   [2] Advanced System Recovery" -ForegroundColor Cyan -NoNewline; Write-Host " (Deep Clean + Rebuild + Optimize)" -ForegroundColor Gray
-    Write-Host "   [3] Data Preservation" -ForegroundColor Cyan -NoNewline; Write-Host " (Manual Snapshot)" -ForegroundColor Gray
-    Write-Host "   [4] Heuristic Log Analysis" -ForegroundColor Cyan -NoNewline; Write-Host " (Error Stream)" -ForegroundColor Gray
-    Write-Host "   [5] Terminate Session" -ForegroundColor Red
+    Write-Host "   [2] Advanced System Recovery" -ForegroundColor Cyan -NoNewline; Write-Host " (Deep Clean + Rebuild)" -ForegroundColor Gray
+    Write-Host "   [3] Optimize Database Tables" -ForegroundColor Cyan -NoNewline; Write-Host " (Defrag/Repair)" -ForegroundColor Gray
+    Write-Host "   [4] Data Preservation" -ForegroundColor Cyan -NoNewline; Write-Host " (Manual Snapshot)" -ForegroundColor Gray
+    Write-Host "   [5] Heuristic Log Analysis" -ForegroundColor Cyan -NoNewline; Write-Host " (Error Stream)" -ForegroundColor Gray
+    Write-Host "   [6] EMERGENCY FACTORY RESET (Fresh Install State)" -ForegroundColor Red
+    Write-Host "   [7] Terminate Session" -ForegroundColor Red
     Write-Host ""
-    $Selection = Read-Host "Enter Command [1-5]"
+    $Selection = Read-Host "Enter Command [1-7]"
     Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
 
-    if ($Selection -eq "5") { break }
+    if ($Selection -eq "7") { break }
 
     # --- EXECUTION LOGIC ---
 
     switch ($Selection) {
         "1" {
             # QUICK REPAIR
+            Write-Host ""
+            Write-Host "> [INFO] This will purge temporary files (PIDs, Lock Files, Logs) to fix common startup errors." -ForegroundColor Cyan
+            Write-Host "> Your databases will NOT be modified." -ForegroundColor Gray
+            $Confirm = Read-Host "Proceed? [Y/n]"
+            if ($Confirm -ne "Y" -and $Confirm -ne "y") { continue }
+            
             Write-Host "> [SYSTEM] Terminating Active Service Threads..." -NoNewline
             Stop-XamppProcesses
             Log-Success " [OK]"
@@ -219,6 +227,12 @@ do {
         
         "2" {
             # DEEP SYSTEM RESTORE (Smart Rebuild)
+            Write-Host ""
+            Write-Host "> [INFO] This will Backup your data, Rebuild the system tables, and Restore your user databases." -ForegroundColor Cyan
+            Write-Host "> Use this for 'Unexpected Shutdown' errors that Quick Repair cannot fix." -ForegroundColor Gray
+            $Confirm = Read-Host "Proceed? [Y/n]"
+            if ($Confirm -ne "Y" -and $Confirm -ne "y") { continue }
+            
             Write-Host "> [SYSTEM] Initializing Process Isolation Sequence... " -NoNewline -ForegroundColor Cyan
             
             # Kill processes first silently
@@ -239,7 +253,7 @@ do {
             # Diagnostic Scan
             Perform-Diagnostic-Scan
             
-            Write-Host "  - [INFO] Critical Corruption Detected. Engaging Smart Rebuild Protocol." -ForegroundColor Gray
+            Write-Host "  Engaging Smart Rebuild Protocol." -ForegroundColor Cyan
             
             # --- SMART REBUILD LOGIC ---
             Write-Host "> [REBUILD] Executing Sandbox Reconstruction..." -ForegroundColor Cyan
@@ -270,7 +284,9 @@ do {
             
             # 4. Transplant User Databases (Folders only, skipping system dbs)
             Write-Host "  - Migrating User Schemas... " -NoNewline -ForegroundColor Gray
-            $Excluded = @('mysql', 'performance_schema', 'phpmyadmin', 'test')
+            # FIX: Do not exclude 'mysql' to prevent ibdata1/system-table mismatch. 
+            # Only exclude folders that are definitely in the fresh backup and generic.
+            $Excluded = @('performance_schema', 'phpmyadmin', 'test') 
             $Folders = Get-ChildItem -Path "$CorruptData" -Directory
             $Count = 0
             foreach ($Folder in $Folders) {
@@ -281,15 +297,72 @@ do {
             }
             Write-Host "Migrated $Count databases." -ForegroundColor Green
             
+            # Safety Net: Abort cleanup if 0 databases found (implies failure or fresh install, unsafe to delete backup)
+            $SafeToCleanup = $true
+            if ($Count -eq 0) { 
+                Write-Host "  - [WARN] Zero databases migrated. Preserving temp backup for safety." -ForegroundColor Yellow 
+                $SafeToCleanup = $false
+            }
+
             # 5. Cleanup New Data Environment
+            # 5. Cleanup New Data Environment (Force Fresh Logs)
             Remove-Item "$DATA_DIR\mysql_error.log" -Force -ErrorAction SilentlyContinue
             Remove-Item "$DATA_DIR\*.pid" -Force -ErrorAction SilentlyContinue
             Remove-Item "$DATA_DIR\ib_logfile*" -Force -ErrorAction SilentlyContinue
-            Remove-Item "$DATA_DIR\aria_log_control" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$DATA_DIR\aria_log*" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$DATA_DIR\ib_buffer_pool" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$DATA_DIR\multi-master.info" -Force -ErrorAction SilentlyContinue
             
             Write-Host "> [STATUS] Reconstruction Sequence Completed." -ForegroundColor Cyan
             
-            # Optimization Step
+            # Graceful Shutdown to preserve data integrity
+            Write-Host "  - [SHUTDOWN] Stopping Repair Engine..." -ForegroundColor Gray
+            if (Test-Path "$MYSQL_DIR\bin\mysqladmin.exe") {
+                $ShutdownResult = & "$MYSQL_DIR\bin\mysqladmin.exe" --user=root shutdown 2>&1
+            }
+            Start-Sleep -Seconds 3
+            Stop-Process -Name "mysqld" -Force -ErrorAction SilentlyContinue
+
+            
+            # Clear old error logs so they don't trigger false positives on next run
+            Remove-Item "$DATA_DIR\mysql_error.log" -Force -ErrorAction SilentlyContinue
+
+            Write-Host "> [STATUS] System Integrity Verification Passed." -ForegroundColor Cyan
+            Write-Host ""
+            
+            # Cleanup Temp Data
+            if ($SafeToCleanup) {
+                Write-Host "> [CLEANUP] Removing Temporary Repair Files..." -ForegroundColor Cyan
+                if (Test-Path "$CorruptData") {
+                    Remove-Item -Path "$CorruptData" -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Host "  - Temp quarantine data deleted." -ForegroundColor Green
+                }
+                # Optional: Remove temp root if empty
+                if ((Get-ChildItem -Path $TEMP_ROOT).Count -eq 0) {
+                     Remove-Item -Path $TEMP_ROOT -Force -ErrorAction SilentlyContinue
+                }
+            } else {
+                 Write-Host "> [PRESERVED] Temp data kept for manual inspection: $CorruptData" -ForegroundColor Yellow
+            }
+
+            Write-Host ""
+
+            Start-Services-Advanced
+            Open-GUI
+        }
+        
+        "3" {
+            # OPTIMIZE DATABASE TABLES
+            Write-Host ""
+            Write-Host "> [INFO] This will Defragment and Repair all tables using 'mysqlcheck'." -ForegroundColor Cyan
+            Write-Host "> Requires MySQL to be at least partially operational." -ForegroundColor Gray
+            $Confirm = Read-Host "Proceed? [Y/n]"
+            if ($Confirm -ne "Y" -and $Confirm -ne "y") { continue RecoveryLoop }
+            
+            Write-Host "> [SYSTEM] Preparing for Optimization..." -ForegroundColor Cyan
+            Stop-XamppProcesses
+            Resolv-Port-Conflicts 2>$null
+            
             Write-Host "> [OPTIMIZE] Executing Table Optimization Routine..." -ForegroundColor Cyan
             # Start mysqld specifically for optimization
             $OptProc = Start-Process -FilePath "$MYSQL_DIR\bin\mysqld.exe" -ArgumentList "--defaults-file=""$MYSQL_DIR\bin\my.ini"" --standalone" -PassThru -WindowStyle Hidden
@@ -320,7 +393,7 @@ do {
                      $Counter = 0
                      while ($Result = Get-Job -State Running) {
                         $Counter++
-                        if ($Counter -gt 20) { $Counter = 1 } # Loop the visual if it takes long
+                        if ($Counter -gt 20) { $Counter = 1 } 
                         $Filled = "".PadLeft($Counter, $BarChar)
                         $Empty = "".PadLeft(20 - $Counter, ' ')
                         Write-Host -NoNewline "`r> [$Filled$Empty] Processing..." -ForegroundColor Green
@@ -339,41 +412,27 @@ do {
             } else {
                  Write-Host "  - [NOTE] Engine startup timed out. Skipping optimization." -ForegroundColor DarkGray
             }
-
-            # Graceful Shutdown to preserve data integrity
-            Write-Host "  - [SHUTDOWN] Stopping Optimization Engine..." -ForegroundColor Gray
+            
+            # Graceful Shutdown
+            Write-Host "  - [SHUTDOWN] Stopping Repair Engine..." -ForegroundColor Gray
             if (Test-Path "$MYSQL_DIR\bin\mysqladmin.exe") {
                 $ShutdownResult = & "$MYSQL_DIR\bin\mysqladmin.exe" --user=root shutdown 2>&1
             }
             Start-Sleep -Seconds 3
             Stop-Process -Name "mysqld" -Force -ErrorAction SilentlyContinue
-
             
-            # Clear old error logs so they don't trigger false positives on next run
-            Remove-Item "$DATA_DIR\mysql_error.log" -Force -ErrorAction SilentlyContinue
-
-            Write-Host "> [STATUS] System Integrity Verification Passed." -ForegroundColor Cyan
-            Write-Host ""
-            
-            # Cleanup Temp Data
-            Write-Host "> [CLEANUP] Removing Temporary Repair Files..." -ForegroundColor Cyan
-            if (Test-Path "$CorruptData") {
-                Remove-Item -Path "$CorruptData" -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Host "  - Temp quarantine data deleted." -ForegroundColor Green
-            }
-            # Optional: Remove temp root if empty
-            if ((Get-ChildItem -Path $TEMP_ROOT).Count -eq 0) {
-                 Remove-Item -Path $TEMP_ROOT -Force -ErrorAction SilentlyContinue
-            }
-
-            Write-Host ""
-
             Start-Services-Advanced
             Open-GUI
         }
         
-        "3" {
+        "4" {
             # BACKUP
+            Write-Host ""
+            Write-Host "> [INFO] This will safely Snapshot your entire 'data' folder to a timestamped backup." -ForegroundColor Cyan
+            Write-Host "> Use this before attempting risky manual changes." -ForegroundColor Gray
+            $Confirm = Read-Host "Proceed? [Y/n]"
+            if ($Confirm -ne "Y" -and $Confirm -ne "y") { continue RecoveryLoop }
+            
             Write-Host "> [BACKUP] Initiating redundancy protocol..."
             $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
             $SafeBackup = "$MYSQL_DIR\data_backup_$Timestamp"
@@ -381,15 +440,93 @@ do {
             Copy-Item -Path "$DATA_DIR\*" -Destination $SafeBackup -Recurse -Force -ErrorAction SilentlyContinue
             Log-Success "> Backup verified: $SafeBackup"
         }
-        
-        "4" {
+
+        "5" {
             # LOGS
+            Write-Host ""
+            Write-Host "> [INFO] This will display the last 15 lines of the MySQL error log." -ForegroundColor Cyan
+            $Confirm = Read-Host "View Logs? [Y/n]"
+            if ($Confirm -ne "Y" -and $Confirm -ne "y") { continue RecoveryLoop }
+            
             if (Test-Path $LOG_FILE) {
                 Log-Title "> [DIAG] Log Review (Tail 15):"
                 Get-Content $LOG_FILE -Tail 15 | ForEach-Object {
                     if ($_ -match "Error") { Write-Host $_ -ForegroundColor Red } else { Write-Host $_ -ForegroundColor Gray }
                 }
             } else { Log-Warn "> Log file unavailable." }
+        }
+
+        "6" {
+            # EMERGENCY FACTORY RESET
+            
+            # Pre-calculate backup path (Internal use for safe wipe)
+            $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $BrokenBackup = "$TEMP_ROOT\data_crashed_$Timestamp"
+            
+            Write-Host ""
+            Write-Host "> [WARNING] This will completely wipe the current 'data' folder and reset MySQL to factory defaults." -ForegroundColor Red
+            Write-Host "> This is a destructive operation (Fresh Install State)." -ForegroundColor Red
+            $Confirm = Read-Host "Are you sure? [Y/n]"
+            
+            if ($Confirm -eq "Y" -or $Confirm -eq "y") {
+                Write-Host "> [RESET] Initiating Factory Reset Protocol..." -ForegroundColor Cyan
+                
+                # 1. Stop Services
+                Stop-XamppProcesses
+                
+                # 2. Reset Data Container
+                
+                # Ensure Temp Root Exists
+                if (-not (Test-Path $TEMP_ROOT)) {
+                    New-Item -ItemType Directory -Force -Path $TEMP_ROOT | Out-Null
+                }
+
+                Write-Host "  - Wiping current data..." -ForegroundColor Gray
+                Move-Item -Path "$DATA_DIR" -Destination "$BrokenBackup"
+                
+                # 3. Restore from Internal Backup
+                Write-Host "  - Restoring from XAMPP internal backup..." -ForegroundColor Gray
+                Copy-Item -Path "$BACKUP_DIR" -Destination "$DATA_DIR" -Recurse
+                
+                Log-Success "> [SUCCESS] Factory Reset Complete."
+                Write-Host "  MySQL has been reset to its initial installation state." -ForegroundColor Green
+                
+                Start-Services-Advanced
+                
+                # RECOVERY NORMALIZATION: Check if we are stuck in Read-Only Mode
+                $MyIni = "$MYSQL_DIR\bin\my.ini"
+                if (Test-Path $MyIni) {
+                    $Content = Get-Content $MyIni -Raw
+                    if ($Content -match "innodb_force_recovery") {
+                        Write-Host ""
+                        Write-Host "> [FIX] Removing Emergency Mode Flag to restore Read/Write access..." -ForegroundColor Cyan
+                        $CleanContent = $Content -replace "`n\[mysqld\]`ninnodb_force_recovery = \d", " "
+                        $CleanContent = $CleanContent -replace "innodb_force_recovery = \d", " "
+                        Set-Content -Path $MyIni -Value $CleanContent
+                        
+                        Write-Host "  - Restarting Engine in Normal Mode..." -ForegroundColor Gray
+                        Stop-Process -Name "mysqld" -Force -ErrorAction SilentlyContinue
+                        Start-Process -FilePath "$MYSQL_DIR\bin\mysqld.exe" -ArgumentList "--defaults-file=""$MYSQL_DIR\bin\my.ini"" --standalone" -WindowStyle Hidden
+                        Start-Sleep -Seconds 5
+                        Log-Success "  - [NORMALIZED] MySQL is now fully operational (Read/Write)."
+                    }
+                }
+
+                # CLEANUP (Per User Request)
+                Write-Host "> [CLEANUP] Removing Crashed Data Dump..." -ForegroundColor Cyan
+                if (Test-Path "$BrokenBackup") {
+                    Remove-Item -Path "$BrokenBackup" -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Host "  - Crashed data deleted." -ForegroundColor Green
+                }
+                # Optional: Remove temp root if empty
+                if ((Get-ChildItem -Path $TEMP_ROOT).Count -eq 0) {
+                     Remove-Item -Path $TEMP_ROOT -Force -ErrorAction SilentlyContinue
+                }
+
+                Open-GUI
+            } else {
+                Write-Host "  - Reset Cancelled." -ForegroundColor Yellow
+            }
         }
     }
 
